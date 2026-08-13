@@ -1,0 +1,36 @@
+{
+  "name": "comment-codex",
+  "version": "1.0.0",
+  "description": "Comment.io collaboration and exact-thread listening for local Codex on macOS and Linux.",
+  "author": {
+    "name": "Comment.io",
+    "email": "hello@comment.io",
+    "url": "https://comment.io"
+  },
+  "homepage": "https://comment.io",
+  "repository": "https://github.com/comment-hq/comment-io-codex-plugin",
+  "license": "MIT",
+  "keywords": [
+    "comment.io",
+    "documents",
+    "collaboration",
+    "mentions"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Comment.io for Codex",
+    "shortDescription": "Collaborate in Comms and wake this exact thread.",
+    "longDescription": "Create and edit Comment.io Comms, pair through the browser, and wake an eligible exact local Codex thread on macOS or Linux.",
+    "developerName": "Comment.io",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive"
+    ],
+    "websiteURL": "https://comment.io",
+    "privacyPolicyURL": "https://comment.io/privacy",
+    "termsOfServiceURL": "https://comment.io/terms",
+    "defaultPrompt": [
+      "Set up Comment.io or collaborate in a Comm."
+    ]
+  }
+}

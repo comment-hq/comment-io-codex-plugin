@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+input=$(cat || true)
+session=$(printf '%s' "$input" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+case "$session" in ''|*[!A-Za-z0-9._:-]*) exit 0 ;; esac
+CODEX_THREAD_ID=$session
+export CODEX_THREAD_ID
+exec "${PLUGIN_ROOT:?}/runtime/comment-plugin" listen stop

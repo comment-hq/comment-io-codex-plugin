@@ -1,0 +1,16 @@
+{
+  "description": "Clean up the exact Comment.io listener when Codex reports session end.",
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh \"${PLUGIN_ROOT}/hooks/comment-session-hook\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

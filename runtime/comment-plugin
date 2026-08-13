@@ -1,0 +1,374 @@
+#!/bin/sh
+
+set -eu
+umask 077
+
+runtime_dir=$(CDPATH='' cd "$(dirname "$0")" && /bin/pwd -P)
+. "$runtime_dir/host.sh"
+. "$runtime_dir/lib.sh"
+
+origin=https://comment.io
+method=
+path=
+body=
+slug=
+outcome=
+operation=
+reply_operation=
+edit_operation=
+
+command=${1:-}
+[ -n "$command" ] || cio_die USAGE 64
+shift
+subcommand=
+case "$command" in setup|listen) subcommand=${1:-}; [ -n "$subcommand" ] || cio_die USAGE 64; shift ;; esac
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --origin) [ "$#" -ge 2 ] || cio_die USAGE 64; origin=$2; shift 2 ;;
+    --method) [ "$#" -ge 2 ] || cio_die USAGE 64; method=$2; shift 2 ;;
+    --path) [ "$#" -ge 2 ] || cio_die USAGE 64; path=$2; shift 2 ;;
+    --body) [ "$#" -ge 2 ] || cio_die USAGE 64; body=$2; shift 2 ;;
+    --slug) [ "$#" -ge 2 ] || cio_die USAGE 64; slug=$2; shift 2 ;;
+    --outcome) [ "$#" -ge 2 ] || cio_die USAGE 64; outcome=$2; shift 2 ;;
+    --operation) [ "$#" -ge 2 ] || cio_die USAGE 64; operation=$2; shift 2 ;;
+    --reply-operation) [ "$#" -ge 2 ] || cio_die USAGE 64; reply_operation=$2; shift 2 ;;
+    --edit-operation) [ "$#" -ge 2 ] || cio_die USAGE 64; edit_operation=$2; shift 2 ;;
+    *) cio_die USAGE 64 ;;
+  esac
+done
+
+origin=$(cio_origin "$origin")
+
+setup_start() {
+  install=$(cio_install_file "$origin")
+  if cio_validate_file "$install"; then printf '%s\n' READY; return; fi
+  pending=$(cio_pending_file "$origin")
+  if cio_validate_file "$pending"; then
+    url=$(cio_field "$pending" verification_uri_complete)
+    code=$(cio_field "$pending" user_code)
+    printf 'PAIR %s %s\n' "$url" "$code"
+    return
+  fi
+  request=$(cio_temp_file); response=$(cio_temp_file)
+  label=$(cio_host_label)
+  printf '{"label":"%s","hosts":["%s"]}\n' "$label" "$cio_host" | cio_atomic_write "$request"
+  code=$(curl --silent --show-error --proto '=https' --max-redirs 0 --connect-timeout 10 --max-time 30 \
+    --request POST --header 'Accept: application/json' --header 'Content-Type: application/json' \
+    --data-binary "@$request" --output "$response" --write-out '%{http_code}' "$origin/plugin/pair/start") || cio_die PAIR_START_FAILED
+  /bin/rm -f "$request"
+  [ "$code" = 201 ] || { cio_redact <"$response" >&2; /bin/rm -f "$response"; cio_die PAIR_START_FAILED; }
+  device=$(cio_json_string device_code "$response")
+  user=$(cio_json_string user_code "$response")
+  url=$(cio_json_string verification_uri_complete "$response")
+  interval=$(cio_json_number interval "$response")
+  case "$device:$user:$url:$interval" in pdc_*:[A-Z2-9][A-Z2-9][A-Z2-9][A-Z2-9][A-Z2-9][A-Z2-9][A-Z2-9][A-Z2-9]:https://*:*) ;; *) cio_die PAIR_RESPONSE_INVALID ;; esac
+  {
+    printf 'origin=%s\n' "$origin"
+    printf 'device_code=%s\n' "$device"
+    printf 'user_code=%s\n' "$user"
+    printf 'verification_uri_complete=%s\n' "$url"
+    printf 'interval=%s\n' "$interval"
+  } | cio_atomic_write "$pending"
+  /bin/rm -f "$response"
+  cio_open_browser "$url" || true
+  printf 'PAIR %s %s\n' "$url" "$user"
+}
+
+setup_finish() {
+  install=$(cio_install_file "$origin")
+  if cio_validate_file "$install"; then
+    response=$(cio_temp_file)
+    code=$(cio_curl "$install" GET "$origin" /plugin/installation '' "$response") || cio_die SETUP_CHECK_FAILED
+    if [ "$code" = 200 ]; then /bin/rm -f "$response"; printf '%s\n' READY; return; fi
+    if [ "$code" = 401 ]; then /bin/rm -f "$response" "$install"; printf '%s\n' NOT_STARTED; return; fi
+    /bin/rm -f "$response"
+    printf '%s\n' REPAIR_REQUIRED
+    return
+  fi
+  pending=$(cio_pending_file "$origin")
+  if ! cio_validate_file "$pending"; then printf '%s\n' NOT_STARTED; return; fi
+  device=$(cio_field "$pending" device_code)
+  request=$(cio_temp_file); response=$(cio_temp_file)
+  printf '{"device_code":"%s"}\n' "$device" | cio_atomic_write "$request"
+  code=$(curl --silent --show-error --proto '=https' --max-redirs 0 --connect-timeout 10 --max-time 30 \
+    --request POST --header 'Accept: application/json' --header 'Content-Type: application/json' \
+    --data-binary "@$request" --output "$response" --write-out '%{http_code}' "$origin/plugin/pair/redeem") || cio_die PAIR_FINISH_FAILED
+  /bin/rm -f "$request"
+  if [ "$code" = 400 ] || [ "$code" = 429 ]; then /bin/rm -f "$response"; printf '%s\n' PENDING; return; fi
+  if [ "$code" = 404 ] || [ "$code" = 410 ]; then /bin/rm -f "$response" "$pending"; printf '%s\n' EXPIRED; return; fi
+  [ "$code" = 200 ] || { cio_redact <"$response" >&2; /bin/rm -f "$response"; cio_die PAIR_FINISH_FAILED; }
+  secret=$(cio_json_string agent_mint_key "$response")
+  installation=$(cio_json_string installation_id "$response")
+  returned_origin=$(cio_json_string origin "$response")
+  case "$secret:$installation" in amk_*:pli_*) ;; *) cio_die PAIR_RESPONSE_INVALID ;; esac
+  [ "$returned_origin" = "$origin" ] || cio_die PAIR_RESPONSE_INVALID
+  {
+    printf 'origin=%s\n' "$origin"
+    printf 'installation_id=%s\n' "$installation"
+    printf 'secret=%s\n' "$secret"
+  } | cio_atomic_write "$install"
+  /bin/rm -f "$response" "$pending"
+  printf '%s\n' READY
+}
+
+load_stored_identity() {
+  candidate=$1 expected_conversation=$2
+  cio_validate_file "$candidate" || return 1
+  [ "$(cio_field "$candidate" origin 2>/dev/null || true)" = "$origin" ] || return 1
+  [ "$(cio_field "$candidate" conversation_hash 2>/dev/null || true)" = "$(cio_hash "$expected_conversation")" ] || return 1
+  stored_agent=$(cio_field "$candidate" agent_id 2>/dev/null || true)
+  stored_handle=$(cio_field "$candidate" handle 2>/dev/null || true)
+  stored_secret=$(cio_field "$candidate" secret 2>/dev/null || true)
+  stored_credential=$(cio_field "$candidate" credential_id 2>/dev/null || true)
+  stored_installation=$(cio_field "$candidate" installation_id 2>/dev/null || true)
+  stored_kind=$(cio_field "$candidate" identity_kind 2>/dev/null || true)
+  case "$stored_agent:$stored_secret:$stored_credential:$stored_installation:$stored_kind" in
+    ag_*:as_*:plc_*:pli_*:ephemeral|ag_*:as_*:plc_*:pli_*:durable) ;;
+    *) return 1 ;;
+  esac
+  cio_safe_id "$stored_agent" 80 && cio_safe_id "$stored_handle" 128 \
+    && cio_safe_id "$stored_secret" 256 && cio_safe_id "$stored_credential" 80 \
+    && cio_safe_id "$stored_installation" 80 || return 1
+  CIO_IDENTITY=$candidate CIO_HANDLE=$stored_handle CIO_KIND=$stored_kind CIO_CONVERSATION=$expected_conversation
+  export CIO_IDENTITY CIO_HANDLE CIO_KIND CIO_CONVERSATION
+}
+
+ensure_identity() {
+  conversation=$(cio_conversation_id)
+  install=$(cio_install_file "$origin")
+  identity=$(cio_identity_file "$origin" "$conversation")
+  if ! cio_validate_file "$install"; then
+    load_stored_identity "$identity" "$conversation" || cio_die SETUP_REQUIRED 2
+    return
+  fi
+  lock=$identity.lock
+  cio_lock "$lock"
+  request=$(cio_temp_file); response=$(cio_temp_file)
+  printf '{"conversation_id":"%s","display_name":"%s"}\n' "$conversation" "$(cio_host_display_name)" | cio_atomic_write "$request"
+  code=$(cio_curl "$install" POST "$origin" /plugin/conversations/resolve "$request" "$response") || { cio_unlock "$lock"; cio_die IDENTITY_FAILED; }
+  /bin/rm -f "$request"
+  if [ "$code" = 401 ]; then
+    /bin/rm -f "$response" "$install"
+    if load_stored_identity "$identity" "$conversation"; then cio_unlock "$lock"; return; fi
+    cio_unlock "$lock"; cio_die SETUP_REQUIRED 2
+  fi
+  [ "$code" = 200 ] || [ "$code" = 201 ] || { cio_redact <"$response" >&2; /bin/rm -f "$response"; cio_unlock "$lock"; cio_die IDENTITY_FAILED; }
+  agent=$(cio_json_string agent_id "$response")
+  handle=$(cio_json_string handle "$response")
+  secret=$(cio_json_string agent_secret "$response")
+  credential=$(cio_json_string credential_id "$response")
+  installation=$(cio_json_string installation_id "$response")
+  kind=$(cio_json_string identity_kind "$response")
+  case "$agent:$handle:$secret:$credential:$installation:$kind" in ag_*:*:as_*:plc_*:pli_*:ephemeral|ag_*:*:as_*:plc_*:pli_*:durable) ;; *) /bin/rm -f "$response"; cio_unlock "$lock"; cio_die IDENTITY_RESPONSE_INVALID ;; esac
+  {
+    printf 'origin=%s\n' "$origin"
+    printf 'conversation_hash=%s\n' "$(cio_hash "$conversation")"
+    printf 'agent_id=%s\n' "$agent"
+    printf 'handle=%s\n' "$handle"
+    printf 'secret=%s\n' "$secret"
+    printf 'credential_id=%s\n' "$credential"
+    printf 'installation_id=%s\n' "$installation"
+    printf 'identity_kind=%s\n' "$kind"
+  } | cio_atomic_write "$identity"
+  /bin/rm -f "$response"
+  cio_unlock "$lock"
+  CIO_IDENTITY=$identity CIO_HANDLE=$handle CIO_KIND=$kind CIO_CONVERSATION=$conversation
+  export CIO_IDENTITY CIO_HANDLE CIO_KIND CIO_CONVERSATION
+}
+
+listen_bind() {
+  ensure_identity
+  "$runtime_dir/listener.sh" retry-releases "$origin" >/dev/null 2>&1 || true
+  binding=$(cio_binding_file "$origin" "$CIO_CONVERSATION")
+  binding_lock=$binding.bind-lock
+  binding_lock_held=false
+  release_binding_lock() {
+    if [ "$binding_lock_held" = true ]; then
+      binding_lock_held=false
+      cio_unlock "$binding_lock" >/dev/null 2>&1 || true
+    fi
+  }
+  trap release_binding_lock EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  cio_lock "$binding_lock"
+  binding_lock_held=true
+  if cio_validate_file "$binding.attempt"; then cio_die WORK_IN_PROGRESS 75; fi
+  request=$(cio_temp_file); response=$(cio_temp_file)
+  printf '{"conversation_id":"%s","host":"%s"}\n' "$CIO_CONVERSATION" "$cio_host" | cio_atomic_write "$request"
+  code=$(cio_curl "$CIO_IDENTITY" POST "$origin" /agents/me/notifications/plugin-session/bind "$request" "$response") || {
+    /bin/rm -f "$request" "$response"
+    cio_die LISTEN_BIND_FAILED
+  }
+  /bin/rm -f "$request"
+  [ "$code" = 201 ] || { cio_redact <"$response" >&2; /bin/rm -f "$response"; cio_die LISTEN_BIND_FAILED; }
+  session=$(cio_json_string plugin_session_id "$response")
+  generation=$(cio_json_number binding_generation "$response")
+  state=$(cio_json_string state "$response")
+  case "$session:$generation:$state" in ps_*:[1-9]*:active) ;; *) /bin/rm -f "$response"; cio_die LISTEN_RESPONSE_INVALID ;; esac
+  # Retire any watcher for the previous local generation before publishing the
+  # newly fenced binding. This prevents a live old PID from suppressing the new
+  # exact-session watcher during an explicit rebind.
+  cio_host_disarm "$origin" "$CIO_CONVERSATION"
+  {
+    printf 'origin=%s\n' "$origin"
+    printf 'identity=%s\n' "$CIO_IDENTITY"
+    printf 'plugin_session_id=%s\n' "$session"
+    printf 'binding_generation=%s\n' "$generation"
+    printf 'conversation_hash=%s\n' "$(cio_hash "$CIO_CONVERSATION")"
+  } | cio_atomic_write "$binding"
+  /bin/rm -f "$response"
+  /bin/rm -f "$binding.pickup"
+  cio_host_arm "$origin" "$CIO_CONVERSATION" "$binding"
+  cio_unlock "$binding_lock"
+  binding_lock_held=false
+  trap - EXIT HUP INT TERM
+  printf 'ARMED @%s generation=%s verified=false\n' "$CIO_HANDLE" "$generation"
+}
+
+listen_status() {
+  conversation=$(cio_conversation_id)
+  binding=$(cio_binding_file "$origin" "$conversation")
+  if ! cio_validate_file "$binding"; then printf '%s\n' STOPPED; return; fi
+  identity=$(cio_field "$binding" identity)
+  session=$(cio_field "$binding" plugin_session_id)
+  generation=$(cio_field "$binding" binding_generation)
+  request=$(cio_temp_file); response=$(cio_temp_file)
+  printf '{"plugin_session_id":"%s","binding_generation":%s}\n' "$session" "$generation" | cio_atomic_write "$request"
+  code=$(cio_curl "$identity" POST "$origin" /agents/me/notifications/plugin-session/status "$request" "$response") || cio_die LISTEN_STATUS_FAILED
+  /bin/rm -f "$request"
+  if [ "$code" = 200 ]; then state=$(cio_json_string state "$response"); /bin/rm -f "$response"; printf '%s generation=%s verified=false\n' "$(printf '%s' "$state" | tr '[:lower:]' '[:upper:]')" "$generation"; return; fi
+  /bin/rm -f "$response"
+  printf '%s\n' STALE
+}
+
+listen_stop() {
+  conversation=$(cio_conversation_id)
+  binding=$(cio_binding_file "$origin" "$conversation")
+  "$runtime_dir/listener.sh" retry-releases "$origin" >/dev/null 2>&1 || true
+  binding_lock=$binding.bind-lock
+  binding_lock_held=false
+  release_snapshot_ready=false
+  release_binding_lock() {
+    if [ "$release_snapshot_ready" = true ]; then
+      /bin/rm -f "$binding" "$binding.payload" "$binding.keeper" "$binding.pid" "$binding.pickup"
+    fi
+    if [ "$binding_lock_held" = true ]; then
+      binding_lock_held=false
+      cio_unlock "$binding_lock" >/dev/null 2>&1 || true
+    fi
+  }
+  trap release_binding_lock EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  cio_lock "$binding_lock"
+  binding_lock_held=true
+  if ! cio_validate_file "$binding"; then
+    /bin/rm -f "$binding.attempt" "$binding.payload" "$binding.keeper" "$binding.pid" "$binding.pickup"
+    cio_unlock "$binding_lock"; binding_lock_held=false; trap - EXIT HUP INT TERM
+    printf '%s\n' STOPPED
+    return
+  fi
+  identity=$(cio_field "$binding" identity)
+  session=$(cio_field "$binding" plugin_session_id)
+  generation=$(cio_field "$binding" binding_generation)
+  had_attempt=false
+  if cio_validate_file "$binding.attempt"; then
+    had_attempt=true
+    "$runtime_dir/listener.sh" local-stop "$origin" >/dev/null 2>&1 || true
+  fi
+  cio_host_disarm "$origin" "$conversation"
+  release_snapshot=$cio_state/.release.$cio_host.$(cio_origin_key "$origin").$(openssl rand -hex 8)
+  if [ "$had_attempt" = true ]; then
+    /bin/mv "$binding.attempt" "$release_snapshot"
+    release_snapshot_ready=true
+  fi
+  /bin/rm -f "$binding" "$binding.payload" "$binding.keeper" "$binding.pid" "$binding.pickup"
+  if [ "$had_attempt" = true ]; then
+    "$runtime_dir/listener.sh" release-snapshot "$origin" "" "$release_snapshot" >/dev/null 2>&1 || true
+  fi
+  release_snapshot_ready=false
+  request=$(cio_temp_file); response=$(cio_temp_file)
+  printf '{"plugin_session_id":"%s","binding_generation":%s}\n' "$session" "$generation" | cio_atomic_write "$request"
+  code=$(cio_curl "$identity" POST "$origin" /agents/me/notifications/plugin-session/stop "$request" "$response") || true
+  /bin/rm -f "$request" "$response"
+  /bin/rm -f "$binding.attempt" "$binding.payload" "$binding.keeper" "$binding.pid" "$binding.pickup"
+  [ "${code:-000}" = 200 ] || [ "${code:-000}" = 404 ] || [ "${code:-000}" = 409 ] || cio_die LISTEN_STOP_FAILED
+  cio_unlock "$binding_lock"
+  binding_lock_held=false
+  trap - EXIT HUP INT TERM
+  printf '%s\n' STOPPED
+}
+
+choose_handle() {
+  ensure_identity
+  installation=$(cio_field "$CIO_IDENTITY" installation_id)
+  url=$origin/setup/plugin/handle#installation=$installation\&conversation=$CIO_CONVERSATION
+  cio_open_browser "$url" || true
+  printf 'CHOOSE %s\n' "$url"
+}
+
+request_api() {
+  [ -n "$method" ] && [ -n "$path" ] || cio_die USAGE 64
+  ensure_identity
+  credential=$(cio_credential_for_path "$origin" "$path" "$CIO_IDENTITY")
+  request_body=
+  if [ "$method" != GET ]; then
+    request_body=$(cio_temp_file)
+    /bin/cat | cio_atomic_write "$request_body"
+    if [ ! -s "$request_body" ]; then /bin/rm -f "$request_body"; request_body=; fi
+  fi
+  response=$(cio_temp_file)
+  code=$(cio_curl "$credential" "$method" "$origin" "$path" "$request_body" "$response") || cio_die REQUEST_FAILED
+  [ -z "$request_body" ] || /bin/rm -f "$request_body"
+  printf 'HTTP %s\n' "$code"
+  cio_redact <"$response"
+  /bin/rm -f "$response"
+}
+
+adopt_document() {
+  case "$slug" in [a-z0-9][a-z0-9-]*) ;; *) cio_die INVALID_SLUG 64 ;; esac
+  ensure_identity
+  source=$(sed -n '1p')
+  case "$source" in ''|*[!A-Za-z0-9._:-]*) cio_die INVALID_SOURCE_CREDENTIAL 64 ;; esac
+  request=$(cio_temp_file); response=$(cio_temp_file)
+  cleanup_adoption() { /bin/rm -f "$request" "$response"; }
+  trap cleanup_adoption EXIT
+  trap 'cleanup_adoption; exit 129' HUP
+  trap 'cleanup_adoption; exit 130' INT
+  trap 'cleanup_adoption; exit 143' TERM
+  printf '{"source_token":"%s"}\n' "$source" | cio_atomic_write "$request"
+  source=
+  code=$(cio_curl "$CIO_IDENTITY" POST "$origin" "/agents/me/documents/$slug/adopt" "$request" "$response") || cio_die ADOPTION_FAILED
+  /bin/rm -f "$request"
+  [ "$code" = 200 ] || [ "$code" = 201 ] || { cio_redact <"$response" >&2; /bin/rm -f "$response"; cio_die ADOPTION_FAILED; }
+  token=$(cio_json_string access_token "$response")
+  handle=$(cio_json_string handle "$response")
+  role=$(cio_json_string role "$response")
+  case "$token:$role" in dt_*:viewer|dt_*:commenter|dt_*:editor|ct_*:viewer|ct_*:commenter|ct_*:editor) ;; *) cio_die ADOPTION_RESPONSE_INVALID ;; esac
+  document=$cio_state/document-$cio_host-$(cio_origin_key "$origin")-$slug
+  { printf 'origin=%s\nslug=%s\nsecret=%s\n' "$origin" "$slug" "$token"; } | cio_atomic_write "$document"
+  /bin/rm -f "$response"
+  trap - EXIT HUP INT TERM
+  printf 'ADOPTED @%s role=%s\n' "$handle" "$role"
+}
+
+case "$command:$subcommand" in
+  setup:start) setup_start ;;
+  setup:finish) setup_finish ;;
+  identity:) ensure_identity; printf 'IDENTITY @%s kind=%s\n' "$CIO_HANDLE" "$CIO_KIND" ;;
+  request:) request_api ;;
+  adopt:) adopt_document ;;
+  listen:bind) listen_bind ;;
+  listen:status) listen_status ;;
+  listen:stop) listen_stop ;;
+  listen:choose-handle) choose_handle ;;
+  receive:) cio_host_receive "$origin" ;;
+  settle:) cio_host_settle "$origin" "$outcome" "$operation" "$reply_operation" "$edit_operation" ;;
+  release:) cio_host_release "$origin" ;;
+  hook:) cio_host_hook "$origin" ;;
+  *) cio_die USAGE 64 ;;
+esac
