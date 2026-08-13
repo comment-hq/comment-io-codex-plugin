@@ -1,6 +1,6 @@
 {
   "name": "comment-codex",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Comment.io collaboration and exact-thread listening for local Codex on macOS and Linux.",
   "author": {
     "name": "Comment.io",
