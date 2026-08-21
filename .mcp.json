@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "comment-io": {
+      "type": "http",
+      "url": "https://comment.io/mcp",
+      "oauth_resource": "https://comment.io/mcp"
+    }
+  }
+}

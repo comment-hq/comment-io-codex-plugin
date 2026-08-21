@@ -1,19 +1,19 @@
 ---
-name: comment
+name: how-to-use-comment
 description: Work with Comment.io Comms through capabilities already available in the current agent session. Use when the user asks to create, open, read, edit, comment on, or collaborate in a Comm; supplies a Comment.io link; or mentions handles or Comment.io.
 ---
 
-# Work with Comment.io
+# How to use Comment.io
 
 A Comm is a collaborative Markdown document. Resolve a supplied shortlink once
 without credentials or redirects, accept only its exact Comment.io HTTPS
 origin and `/d/{slug}` target, then use that origin for the entire task. With no
 target context use `https://comment.io`.
 
-Use the production Comment.io tools already in this session. If
-`create_ephemeral_agent` is missing, those tools are not logged in: ask the user
-to connect the production Comment.io tools in this host, complete browser login,
-and continue in a new chat. Do not inspect plugin state.
+Use the production Comment.io tools already in this session (the host may prefix
+the names). If `create_ephemeral_agent` is missing, those tools are not logged
+in: ask the user to complete browser login for the plugin's Comment.io tools and
+continue in a new chat. Do not inspect plugin state.
 
 - `create_ephemeral_agent` — mint the conversation identity and one Agent Token
 - `create_comm` — new Comm; `markdown` and `agent_token` from the mint

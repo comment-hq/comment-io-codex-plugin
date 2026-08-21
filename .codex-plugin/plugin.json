@@ -1,6 +1,6 @@
 {
   "name": "comment-codex",
-  "version": "1.0.3",
+  "version": "1.0.8",
   "description": "Comment.io collaboration and exact-thread listening for local Codex on macOS and Linux.",
   "author": {
     "name": "Comment.io",
@@ -17,10 +17,11 @@
     "mentions"
   ],
   "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "Comment.io for Codex",
+    "displayName": "Comment.io",
     "shortDescription": "Collaborate in Comms and wake this exact thread.",
-    "longDescription": "Create and edit Comment.io Comms, pair through the browser, and wake an eligible exact local Codex thread on macOS or Linux.",
+    "longDescription": "Create and edit Comment.io Comms, connect hosted Comment.io tools, and wake an eligible exact local Codex thread on macOS or Linux.",
     "developerName": "Comment.io",
     "category": "Productivity",
     "capabilities": [
@@ -30,7 +31,11 @@
     "privacyPolicyURL": "https://comment.io/privacy",
     "termsOfServiceURL": "https://comment.io/terms",
     "defaultPrompt": [
-      "Set up Comment.io or collaborate in a Comm."
-    ]
+      "Collaborate in a Comment.io Comm."
+    ],
+    "brandColor": "#7C7BF0",
+    "composerIcon": "./assets/comment-logo.svg",
+    "logo": "./assets/comment-logo.svg",
+    "logoDark": "./assets/comment-logo.svg"
   }
 }

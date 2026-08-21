@@ -15,7 +15,7 @@ nor enough context to determine that purpose, immediately ask:
 
 > What should this Comm help its readers understand, decide, or produce?
 
-Wait for the answer before invoking `comment` or `listen`. When a source is
+Wait for the answer before invoking `how-to-use-comment` or `listen`. When a source is
 already supplied, continue without asking; read it after establishing any
 access route it requires and infer its purpose from the content.
 
@@ -24,7 +24,7 @@ from which to infer it.
 
 ## 2. Establish the route and identity
 
-Invoke the installed `comment` skill before any Comment.io action. Then invoke
+Invoke the installed `how-to-use-comment` skill before any Comment.io action. Then invoke
 `listen`; this request authorizes arming the same identity. An unavailable
 listener does not block creation.
 

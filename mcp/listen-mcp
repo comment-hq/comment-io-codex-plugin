@@ -1,6 +1,0 @@
-#!/bin/sh
-set -eu
-dir=$(CDPATH='' cd "$(dirname "$0")" && /bin/pwd -P)
-if [ -z "${COMMENT_PLUGIN_HOST:-}" ]; then COMMENT_PLUGIN_HOST=codex; export COMMENT_PLUGIN_HOST; fi
-command -v node >/dev/null 2>&1 || { printf '%s\n' 'comment.io: node is required for listen tools' >&2; exit 64; }
-exec node "$dir/server.mjs"
