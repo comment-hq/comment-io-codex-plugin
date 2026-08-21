@@ -36,6 +36,22 @@ cio_stat_links() {
   esac
 }
 
+cio_stat_device() {
+  case "$(uname -s)" in
+    Darwin) /usr/bin/stat -f '%d' "$1" ;;
+    Linux) /usr/bin/stat -c '%d' "$1" ;;
+    *) cio_die UNSUPPORTED_HOST 64 ;;
+  esac
+}
+
+cio_stat_inode() {
+  case "$(uname -s)" in
+    Darwin) /usr/bin/stat -f '%i' "$1" ;;
+    Linux) /usr/bin/stat -c '%i' "$1" ;;
+    *) cio_die UNSUPPORTED_HOST 64 ;;
+  esac
+}
+
 cio_has_acl() {
   [ "$(uname -s)" = Darwin ] || return 1
   permissions=$(/bin/ls -lde "$1" 2>/dev/null | sed -n '1{s/[[:space:]].*//;p;}')
@@ -195,7 +211,9 @@ cio_json_first_object() {
 }
 
 cio_lock() {
-  lock=$1 attempts=0
+  lock=$1 max_attempts=${2:-100} attempts=0
+  case "$max_attempts" in ''|*[!0-9]*) cio_die UNSAFE_LOCK ;; esac
+  [ "$max_attempts" -ge 1 ] || cio_die UNSAFE_LOCK
   while ! (
     trap '' HUP INT TERM
     lock_initializing=false
@@ -229,7 +247,7 @@ cio_lock() {
       esac
     fi
     attempts=$((attempts + 1))
-    [ "$attempts" -lt 100 ] || cio_die BUSY 75
+    [ "$attempts" -lt "$max_attempts" ] || cio_die BUSY 75
     /bin/sleep 0.1
   done
   cio_validate_dir "$lock" || cio_die UNSAFE_LOCK
@@ -270,9 +288,55 @@ cio_conversation_id() {
   printf '%s\n' "$value"
 }
 
+cio_stat_mtime() {
+  case "$(uname -s)" in
+    Darwin) /usr/bin/stat -f '%m' "$1" ;;
+    Linux) /usr/bin/stat -c '%Y' "$1" ;;
+    *) cio_die UNSUPPORTED_HOST 64 ;;
+  esac
+}
+
+cio_discover_conversation_origins() {
+  conversation=$(cio_conversation_id) || return 1
+  conv=$(cio_hash "$conversation")
+  found=0
+  for file in "$cio_state"/binding-"$cio_host"-*-"$conv"; do
+    [ -f "$file" ] || continue
+    cio_validate_file "$file" || continue
+    origin_value=$(cio_field "$file" origin) || continue
+    origin_value=$(cio_origin "$origin_value" 2>/dev/null) || continue
+    printf '%s\n' "$origin_value"
+    found=1
+  done
+  [ "$found" = 1 ]
+}
+
+cio_discover_conversation_origin() {
+  latest=
+  latest_mtime=0
+  while IFS= read -r origin_value; do
+    [ -n "$origin_value" ] || continue
+    file=$(cio_binding_file "$origin_value" "$(cio_conversation_id)")
+    mtime=$(cio_stat_mtime "$file") || continue
+    if [ -z "$latest" ] || [ "$mtime" -ge "$latest_mtime" ]; then
+      latest=$origin_value
+      latest_mtime=$mtime
+    fi
+  done <<EOF
+$(cio_discover_conversation_origins || true)
+EOF
+  [ -n "$latest" ] || return 1
+  printf '%s\n' "$latest"
+}
+
 cio_identity_file() {
   origin=$1 conversation=$2
   printf '%s/identity-%s-%s-%s' "$cio_state" "$cio_host" "$(cio_origin_key "$origin")" "$(cio_hash "$conversation")"
+}
+
+cio_listen_identity_file() {
+  origin=$1 conversation=$2
+  printf '%s/listen-identity-%s-%s-%s' "$cio_state" "$cio_host" "$(cio_origin_key "$origin")" "$(cio_hash "$conversation")"
 }
 
 cio_binding_file() {
@@ -286,7 +350,7 @@ cio_curl() {
   case "$path" in /*) ;; *) cio_die INVALID_PATH 64 ;; esac
   case "$path" in *'://'*|*' '*) cio_die INVALID_PATH 64 ;; esac
   secret=$(cio_field "$credential_file" secret) || cio_die CREDENTIAL_UNAVAILABLE 2
-  case "$secret" in amk_*|as_*|ct_*|dt_*|usk_*|pst_*) ;; *) cio_die CREDENTIAL_INVALID 2 ;; esac
+  case "$secret" in amk_*|as_*|ct_*|dt_*|usk_*|pst_*|eat_*|dat_*) ;; *) cio_die CREDENTIAL_INVALID 2 ;; esac
   config=$(cio_temp_file)
   {
     printf '%s\n' 'silent' 'show-error' 'proto = "=https"' 'proto-redir = "=https"' 'max-redirs = 0' 'connect-timeout = 10' 'max-time = 40'
@@ -334,7 +398,7 @@ cio_post_json() {
 
 cio_redact() {
   sed -E \
-    -e 's/(amk|ark|as|ct|dt|usk|pst|pdc)_[A-Za-z0-9._:-]+/[REDACTED]/g' \
+    -e 's/(amk|ark|as|ct|dt|usk|pst|pdc|eat|dat|wwt)_[A-Za-z0-9._:-]+/[REDACTED]/g' \
     -e 's/\"(agent_secret|access_token|source_token|socket_ticket|device_code|agent_mint_key|token)\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"\1\":\"[REDACTED]\"/g'
 }
 

@@ -8,6 +8,7 @@ runtime_dir=$(CDPATH='' cd "$(dirname "$0")" && /bin/pwd -P)
 . "$runtime_dir/lib.sh"
 
 origin=https://comment.io
+origin_explicit=false
 method=
 path=
 body=
@@ -16,6 +17,7 @@ outcome=
 operation=
 reply_operation=
 edit_operation=
+work_item_ids=
 
 command=${1:-}
 [ -n "$command" ] || cio_die USAGE 64
@@ -25,7 +27,7 @@ case "$command" in setup|listen) subcommand=${1:-}; [ -n "$subcommand" ] || cio_
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --origin) [ "$#" -ge 2 ] || cio_die USAGE 64; origin=$2; shift 2 ;;
+    --origin) [ "$#" -ge 2 ] || cio_die USAGE 64; origin=$2; origin_explicit=true; shift 2 ;;
     --method) [ "$#" -ge 2 ] || cio_die USAGE 64; method=$2; shift 2 ;;
     --path) [ "$#" -ge 2 ] || cio_die USAGE 64; path=$2; shift 2 ;;
     --body) [ "$#" -ge 2 ] || cio_die USAGE 64; body=$2; shift 2 ;;
@@ -34,9 +36,21 @@ while [ "$#" -gt 0 ]; do
     --operation) [ "$#" -ge 2 ] || cio_die USAGE 64; operation=$2; shift 2 ;;
     --reply-operation) [ "$#" -ge 2 ] || cio_die USAGE 64; reply_operation=$2; shift 2 ;;
     --edit-operation) [ "$#" -ge 2 ] || cio_die USAGE 64; edit_operation=$2; shift 2 ;;
+    --work-item-ids) [ "$#" -ge 2 ] || cio_die USAGE 64; work_item_ids=$2; shift 2 ;;
     *) cio_die USAGE 64 ;;
   esac
 done
+
+if [ "$origin_explicit" = false ]; then
+  case "$command:$subcommand" in
+    hook:|listen:status|listen:stop|receive:|settle:|release:)
+      discovered=$(cio_discover_conversation_origin 2>/dev/null || true)
+      if [ -n "${discovered:-}" ]; then
+        origin=$discovered
+      fi
+      ;;
+  esac
+fi
 
 origin=$(cio_origin "$origin")
 
@@ -123,13 +137,35 @@ load_stored_identity() {
   stored_credential=$(cio_field "$candidate" credential_id 2>/dev/null || true)
   stored_installation=$(cio_field "$candidate" installation_id 2>/dev/null || true)
   stored_kind=$(cio_field "$candidate" identity_kind 2>/dev/null || true)
-  case "$stored_agent:$stored_secret:$stored_credential:$stored_installation:$stored_kind" in
-    ag_*:as_*:plc_*:pli_*:ephemeral|ag_*:as_*:plc_*:pli_*:durable) ;;
+  case "$stored_secret" in
+    eat_atk_*)
+      stored_owner=$(cio_field "$candidate" owner_agent_id 2>/dev/null || true)
+      stored_grant=$(cio_field "$candidate" grant_id 2>/dev/null || true)
+      stored_generation=$(cio_field "$candidate" grant_revocation_generation 2>/dev/null || true)
+      case "$stored_agent:$stored_kind:$stored_owner:$stored_grant:$stored_generation" in
+        ag_*:ephemeral:ag_*:cgr_*:[0-9]*) ;;
+        *) return 1 ;;
+      esac
+      cio_safe_id "$stored_agent" 80 && cio_safe_id "$stored_handle" 128 \
+        && cio_safe_id "$stored_secret" 256 && cio_safe_id "$stored_owner" 80 \
+        && cio_safe_id "$stored_grant" 80 || return 1
+      ;;
+    dat_ag_*)
+      case "$stored_agent:$stored_kind" in ag_*:durable) ;; *) return 1 ;; esac
+      cio_safe_id "$stored_agent" 80 && cio_safe_id "$stored_handle" 128 \
+        && cio_safe_id "$stored_secret" 256 || return 1
+      ;;
+    as_*)
+      case "$stored_agent:$stored_secret:$stored_credential:$stored_installation:$stored_kind" in
+        ag_*:as_*:plc_*:pli_*:ephemeral|ag_*:as_*:plc_*:pli_*:durable) ;;
+        *) return 1 ;;
+      esac
+      cio_safe_id "$stored_agent" 80 && cio_safe_id "$stored_handle" 128 \
+        && cio_safe_id "$stored_secret" 256 && cio_safe_id "$stored_credential" 80 \
+        && cio_safe_id "$stored_installation" 80 || return 1
+      ;;
     *) return 1 ;;
   esac
-  cio_safe_id "$stored_agent" 80 && cio_safe_id "$stored_handle" 128 \
-    && cio_safe_id "$stored_secret" 256 && cio_safe_id "$stored_credential" 80 \
-    && cio_safe_id "$stored_installation" 80 || return 1
   CIO_IDENTITY=$candidate CIO_HANDLE=$stored_handle CIO_KIND=$stored_kind CIO_CONVERSATION=$expected_conversation
   export CIO_IDENTITY CIO_HANDLE CIO_KIND CIO_CONVERSATION
 }
@@ -138,6 +174,13 @@ ensure_identity() {
   conversation=$(cio_conversation_id)
   install=$(cio_install_file "$origin")
   identity=$(cio_identity_file "$origin" "$conversation")
+  remap=$identity.remap
+  force=${1:-}
+  if [ "$force" != force ] && ! cio_validate_file "$remap"; then
+    if load_stored_identity "$identity" "$conversation"; then
+      return
+    fi
+  fi
   if ! cio_validate_file "$install"; then
     load_stored_identity "$identity" "$conversation" || cio_die SETUP_REQUIRED 2
     return
@@ -171,28 +214,346 @@ ensure_identity() {
     printf 'installation_id=%s\n' "$installation"
     printf 'identity_kind=%s\n' "$kind"
   } | cio_atomic_write "$identity"
-  /bin/rm -f "$response"
+  /bin/rm -f "$response" "$remap"
   cio_unlock "$lock"
   CIO_IDENTITY=$identity CIO_HANDLE=$handle CIO_KIND=$kind CIO_CONVERSATION=$conversation
   export CIO_IDENTITY CIO_HANDLE CIO_KIND CIO_CONVERSATION
 }
 
-listen_bind() {
-  ensure_identity
-  "$runtime_dir/listener.sh" retry-releases "$origin" >/dev/null 2>&1 || true
+work_wake_bind_body() {
+  owner=$(cio_field "$CIO_IDENTITY" owner_agent_id 2>/dev/null || true)
+  grant=$(cio_field "$CIO_IDENTITY" grant_id 2>/dev/null || true)
+  revocation=$(cio_field "$CIO_IDENTITY" grant_revocation_generation 2>/dev/null || true)
+  kind=$(cio_field "$CIO_IDENTITY" identity_kind 2>/dev/null || true)
+  if [ -n "$owner" ] && [ -n "$grant" ] && [ -n "$revocation" ]; then
+    printf '{"conversation_id":"%s","host":"%s","owner_agent_id":"%s","grant_id":"%s","grant_revocation_generation":%s}\n' \
+      "$CIO_CONVERSATION" "$cio_host" "$owner" "$grant" "$revocation"
+    return
+  fi
+  case "$kind" in
+    ephemeral|durable)
+      printf '{"conversation_id":"%s","host":"%s","kind":"%s"}\n' \
+        "$CIO_CONVERSATION" "$cio_host" "$kind"
+      ;;
+    *)
+      printf '{"conversation_id":"%s","host":"%s"}\n' "$CIO_CONVERSATION" "$cio_host"
+      ;;
+  esac
+}
+
+work_wake_generation_body() {
+  identity=$1 generation=$2
+  owner=$(cio_field "$identity" owner_agent_id 2>/dev/null || true)
+  grant=$(cio_field "$identity" grant_id 2>/dev/null || true)
+  revocation=$(cio_field "$identity" grant_revocation_generation 2>/dev/null || true)
+  if [ -n "$owner" ] && [ -n "$grant" ] && [ -n "$revocation" ]; then
+    printf '{"binding_generation":%s,"owner_agent_id":"%s","grant_id":"%s","grant_revocation_generation":%s}\n' \
+      "$generation" "$owner" "$grant" "$revocation"
+    return
+  fi
+  printf '{"binding_generation":%s}\n' "$generation"
+}
+
+listen_adopt() {
+  conversation=$(cio_conversation_id)
+  payload=$(cio_temp_file)
+  cat >"$payload" || { /bin/rm -f "$payload"; cio_die LISTEN_ADOPT_INVALID 64; }
+  token=$(cio_json_string agent_token "$payload")
+  agent=$(cio_json_string agent_id "$payload")
+  handle=$(cio_json_string handle "$payload")
+  owner=$(cio_json_string owner_agent_id "$payload")
+  grant=$(cio_json_string grant_id "$payload")
+  revocation=$(cio_json_number grant_revocation_generation "$payload")
+  kind=$(cio_json_string identity_kind "$payload")
+  /bin/rm -f "$payload"
+  case "$token" in
+    eat_*)
+      [ -z "$kind" ] && kind=ephemeral
+      case "$agent:$handle:$kind:$owner:$grant:$revocation" in
+        ag_*:*:ephemeral:ag_*:cgr_*:[0-9]*) ;;
+        *) cio_die LISTEN_ADOPT_INVALID 64 ;;
+      esac
+      grant_hex=${grant#cgr_}
+      [ "${#grant_hex}" -eq 32 ] || cio_die LISTEN_ADOPT_INVALID 64
+      case "$grant_hex" in *[!0-9a-fA-F]*) cio_die LISTEN_ADOPT_INVALID 64 ;; esac
+      ;;
+    dat_*)
+      [ -z "$kind" ] && kind=durable
+      case "$agent:$handle:$kind" in ag_*:durable) ;; *) cio_die LISTEN_ADOPT_INVALID 64 ;; esac
+      owner= grant= revocation=
+      ;;
+    *) cio_die LISTEN_ADOPT_INVALID 64 ;;
+  esac
+  cio_safe_id "$agent" 80 && cio_safe_id "$handle" 128 && cio_safe_id "$token" 256 || cio_die LISTEN_ADOPT_INVALID 64
+  if [ "$kind" = ephemeral ]; then
+    cio_safe_id "$owner" 80 && cio_safe_id "$grant" 80 || cio_die LISTEN_ADOPT_INVALID 64
+  fi
+  identity=$(cio_listen_identity_file "$origin" "$conversation")
+  binding=$(cio_binding_file "$origin" "$conversation")
+  if cio_validate_file "$binding" \
+    && [ "$(cio_field "$binding" delivery_contract 2>/dev/null || true)" = agent_work_wake_v1 ]; then
+    listen_stop
+  fi
+  lock=$identity.lock
+  cio_lock "$lock"
+  {
+    printf 'origin=%s\n' "$origin"
+    printf 'conversation_hash=%s\n' "$(cio_hash "$conversation")"
+    printf 'agent_id=%s\n' "$agent"
+    printf 'handle=%s\n' "$handle"
+    printf 'secret=%s\n' "$token"
+    printf 'identity_kind=%s\n' "$kind"
+    if [ "$kind" = ephemeral ]; then
+      printf 'owner_agent_id=%s\n' "$owner"
+      printf 'grant_id=%s\n' "$grant"
+      printf 'grant_revocation_generation=%s\n' "$revocation"
+    fi
+  } | cio_atomic_write "$identity"
+  cio_unlock "$lock"
+  token=
+  printf 'ADOPTED @%s kind=%s\n' "$handle" "$kind"
+}
+
+listen_bind_work_wake() {
+  conversation=$(cio_conversation_id)
+  identity=$(cio_listen_identity_file "$origin" "$conversation")
+  load_stored_identity "$identity" "$conversation" || cio_die LISTEN_ADOPT_REQUIRED 2
+  secret=$(cio_field "$CIO_IDENTITY" secret 2>/dev/null || true)
+  case "$secret" in eat_*|dat_*) ;; *) cio_die LISTEN_ADOPT_REQUIRED 2 ;; esac
   binding=$(cio_binding_file "$origin" "$CIO_CONVERSATION")
   binding_lock=$binding.bind-lock
   binding_lock_held=false
+  remote_wake_active=false
   release_binding_lock() {
     if [ "$binding_lock_held" = true ]; then
       binding_lock_held=false
       cio_unlock "$binding_lock" >/dev/null 2>&1 || true
     fi
   }
+  publish_work_wake_binding() {
+    {
+      printf 'origin=%s\n' "$origin"
+      printf 'identity=%s\n' "$CIO_IDENTITY"
+      printf 'delivery_contract=agent_work_wake_v1\n'
+      printf 'binding_generation=%s\n' "$generation"
+      printf 'conversation_hash=%s\n' "$(cio_hash "$CIO_CONVERSATION")"
+    } | cio_atomic_write "$binding"
+  }
+  interrupt_work_wake_bind() {
+    interrupt_status=$1
+    trap '' HUP INT TERM
+    if [ "$remote_wake_active" = true ]; then
+      publish_work_wake_binding
+      request=$(cio_temp_file); response=$(cio_temp_file)
+      work_wake_generation_body "$CIO_IDENTITY" "$generation" | cio_atomic_write "$request"
+      cio_curl "$CIO_IDENTITY" POST "$origin" /agents/me/work/wake/stop "$request" "$response" >/dev/null 2>&1 || true
+      /bin/rm -f "$request" "$response"
+    fi
+    exit "$interrupt_status"
+  }
   trap release_binding_lock EXIT
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  trap 'interrupt_work_wake_bind 129' HUP
+  trap 'interrupt_work_wake_bind 130' INT
+  trap 'interrupt_work_wake_bind 143' TERM
+  cio_lock "$binding_lock"
+  binding_lock_held=true
+  if cio_validate_file "$binding.attempt"; then cio_die WORK_IN_PROGRESS 75; fi
+  request=$(cio_temp_file); response=$(cio_temp_file)
+  work_wake_bind_body | cio_atomic_write "$request"
+  code=$(cio_curl "$CIO_IDENTITY" POST "$origin" /agents/me/work/wake/bind "$request" "$response") || {
+    /bin/rm -f "$request" "$response"
+    cio_die LISTEN_BIND_FAILED
+  }
+  /bin/rm -f "$request"
+  if [ "$code" = 401 ]; then
+    cio_redact <"$response" >&2
+    /bin/rm -f "$response"
+    cio_die LISTEN_IDENTITY_REJECTED 2
+  fi
+  [ "$code" = 201 ] || { cio_redact <"$response" >&2; /bin/rm -f "$response"; cio_die LISTEN_BIND_FAILED; }
+  generation=$(cio_json_number binding_generation "$response")
+  case "$generation" in [1-9]*) ;; *) /bin/rm -f "$response"; cio_die LISTEN_RESPONSE_INVALID ;; esac
+  remote_wake_active=true
+  contract=$(cio_json_string delivery_contract "$response")
+  kind=$(cio_json_string kind "$response")
+  handle=$(cio_json_string handle "$response")
+  case "$contract:$generation:$kind:$handle" in
+    agent_work_wake_v1:[1-9]*:ephemeral:*|agent_work_wake_v1:[1-9]*:durable:*) ;;
+    *) /bin/rm -f "$response"; cio_die LISTEN_RESPONSE_INVALID ;;
+  esac
+  agent_id=$(cio_json_string agent_id "$response")
+  grant_id=$(cio_json_string grant_id "$response")
+  owner_agent_id=$(cio_json_string owner_agent_id "$response")
+  grant_revocation_generation=$(cio_json_number grant_revocation_generation "$response")
+  {
+    printf 'origin=%s\n' "$origin"
+    printf 'identity=%s\n' "$CIO_IDENTITY"
+    printf 'delivery_contract=agent_work_wake_v1\n'
+    printf 'binding_generation=%s\n' "$generation"
+    printf 'conversation_hash=%s\n' "$(cio_hash "$CIO_CONVERSATION")"
+    printf 'activation_kind=%s\n' "$kind"
+    printf 'activation_agent_id=%s\n' "$agent_id"
+    printf 'activation_handle=%s\n' "$handle"
+    [ -z "$grant_id" ] || printf 'activation_grant_id=%s\n' "$grant_id"
+    [ -z "$owner_agent_id" ] || printf 'activation_owner_agent_id=%s\n' "$owner_agent_id"
+    [ -z "$grant_revocation_generation" ] || printf 'activation_grant_revocation_generation=%s\n' "$grant_revocation_generation"
+  } | cio_atomic_write "$binding"
+  /bin/rm -f "$response"
+  if [ "$cio_host" = codex ]; then
+    return
+  fi
+  cio_unlock "$binding_lock"
+  binding_lock_held=false
+  trap - EXIT HUP INT TERM
+  printf 'ARMED @%s generation=%s kind=%s\n' "$handle" "$generation" "$kind"
+  printf 'activation kind=%s agent_id=%s handle=%s' "$kind" "$agent_id" "$handle"
+  [ -z "$grant_id" ] || printf ' grant_id=%s' "$grant_id"
+  [ -z "$owner_agent_id" ] || printf ' owner_agent_id=%s' "$owner_agent_id"
+  [ -z "$grant_revocation_generation" ] || printf ' grant_revocation_generation=%s' "$grant_revocation_generation"
+  printf '\n'
+}
+
+listen_bind() {
+  if [ "$cio_host" = claude-code ]; then
+    listen_bind_work_wake
+    return
+  fi
+  readiness=$(cio_host_listen_readiness "$origin" 2>/dev/null || true)
+  codex_socket_device= codex_socket_inode= codex_thread_session_id= codex_runner_process_id=
+  if [ "$cio_host" = codex ]; then
+    readiness_fields=$(printf '%s' "$readiness" | tr ':' ' ')
+    # shellcheck disable=SC2086
+    set -- $readiness_fields
+    if [ "$#" -eq 5 ] && [ "$1" = ready ]; then
+      codex_socket_device=$2 codex_socket_inode=$3 codex_thread_session_id=$4 codex_runner_process_id=$5
+    fi
+  fi
+  if { [ "$cio_host" = codex ] && [ -z "$codex_runner_process_id" ]; } \
+    || { [ "$cio_host" != codex ] && [ "$readiness" != ready ]; }; then
+    if [ "$cio_host" = codex ]; then
+      printf '%s\n' 'comment.io: Codex native listening requires this thread to be attached to its shared app-server.' >&2
+      printf '%s\n' 'comment.io: Run from a normal terminal: codex app-server daemon start' >&2
+      printf '%s\n' 'comment.io: Then start a fresh session: codex --remote unix://' >&2
+      printf 'comment.io: Local readiness: %s\n' "${readiness:-app_server_unavailable}" >&2
+      cio_die CODEX_APP_SERVER_REQUIRED 2
+    fi
+    cio_die LISTEN_HOST_NOT_READY 2
+  fi
+  if [ "$cio_host" = codex ]; then
+    listen_bind_work_wake
+    bound_generation=$generation
+    binding=$(cio_binding_file "$origin" "$CIO_CONVERSATION")
+    if ! cio_validate_file "$binding" \
+      || [ "$(cio_field "$binding" binding_generation)" != "$bound_generation" ]; then
+      cio_die LISTEN_RESPONSE_INVALID
+    fi
+    temporary=$(cio_temp_file)
+    {
+      /bin/cat "$binding"
+      printf 'codex_socket_device=%s\n' "$codex_socket_device"
+      printf 'codex_socket_inode=%s\n' "$codex_socket_inode"
+      printf 'codex_thread_session_id=%s\n' "$codex_thread_session_id"
+      printf 'codex_runner_process_id=%s\n' "$codex_runner_process_id"
+    } | cio_atomic_write "$temporary"
+    cio_atomic_write "$binding" <"$temporary"
+    /bin/rm -f "$temporary"
+    identity=$(cio_field "$binding" identity)
+    generation=$bound_generation
+    rollback_codex_work_wake() {
+      request=$(cio_temp_file); response=$(cio_temp_file)
+      work_wake_generation_body "$identity" "$bound_generation" | cio_atomic_write "$request"
+      stop_code=$(cio_curl "$identity" POST "$origin" /agents/me/work/wake/stop "$request" "$response") || stop_code=000
+      /bin/rm -f "$request" "$response"
+      case "$stop_code" in 200|404|409) /bin/rm -f "$binding"; return 0 ;; *) return 1 ;; esac
+    }
+    interrupt_codex_arm() {
+      interrupt_status=$1
+      trap '' HUP INT TERM
+      cio_host_disarm "$origin" "$CIO_CONVERSATION"
+      rollback_codex_work_wake || true
+      exit "$interrupt_status"
+    }
+    trap 'interrupt_codex_arm 129' HUP
+    trap 'interrupt_codex_arm 130' INT
+    trap 'interrupt_codex_arm 143' TERM
+    /bin/rm -f "$binding.pickup"
+    cio_host_disarm "$origin" "$CIO_CONVERSATION"
+    if ! (cio_host_arm "$origin" "$CIO_CONVERSATION" "$binding"); then
+      if rollback_codex_work_wake; then
+        cio_die LISTENER_START_FAILED
+      fi
+      cio_die LISTENER_START_ROLLBACK_FAILED
+    fi
+    cio_unlock "$binding_lock"
+    binding_lock_held=false
+    trap - EXIT HUP INT TERM
+    handle=$(cio_field "$binding" activation_handle 2>/dev/null || true)
+    kind=$(cio_field "$binding" activation_kind 2>/dev/null || true)
+    printf 'ARMED @%s generation=%s kind=%s\n' "$handle" "$generation" "$kind"
+    printf 'activation kind=%s agent_id=%s handle=%s' "$kind" \
+      "$(cio_field "$binding" activation_agent_id 2>/dev/null || true)" "$handle"
+    grant_id=$(cio_field "$binding" activation_grant_id 2>/dev/null || true)
+    owner_agent_id=$(cio_field "$binding" activation_owner_agent_id 2>/dev/null || true)
+    grant_revocation_generation=$(cio_field "$binding" activation_grant_revocation_generation 2>/dev/null || true)
+    [ -z "$grant_id" ] || printf ' grant_id=%s' "$grant_id"
+    [ -z "$owner_agent_id" ] || printf ' owner_agent_id=%s' "$owner_agent_id"
+    [ -z "$grant_revocation_generation" ] || printf ' grant_revocation_generation=%s' "$grant_revocation_generation"
+    printf '\n'
+    return
+  fi
+  ensure_identity
+  "$runtime_dir/listener.sh" retry-releases "$origin" >/dev/null 2>&1 || true
+  binding=$(cio_binding_file "$origin" "$CIO_CONVERSATION")
+  binding_lock=$binding.bind-lock
+  binding_lock_held=false
+  remote_session_active=false
+  session= generation=
+  release_binding_lock() {
+    if [ "$binding_lock_held" = true ]; then
+      binding_lock_held=false
+      cio_unlock "$binding_lock" >/dev/null 2>&1 || true
+    fi
+  }
+  publish_listener_binding() {
+    {
+      printf 'origin=%s\n' "$origin"
+      printf 'identity=%s\n' "$CIO_IDENTITY"
+      printf 'plugin_session_id=%s\n' "$session"
+      printf 'binding_generation=%s\n' "$generation"
+      printf 'conversation_hash=%s\n' "$(cio_hash "$CIO_CONVERSATION")"
+      if [ "$cio_host" = codex ]; then
+        printf 'codex_socket_device=%s\n' "$codex_socket_device"
+        printf 'codex_socket_inode=%s\n' "$codex_socket_inode"
+        printf 'codex_thread_session_id=%s\n' "$codex_thread_session_id"
+        printf 'codex_runner_process_id=%s\n' "$codex_runner_process_id"
+      fi
+    } | cio_atomic_write "$binding"
+  }
+  rollback_listener_start() {
+    cio_host_disarm "$origin" "$CIO_CONVERSATION"
+    if stop_remote_plugin_session "$CIO_IDENTITY" "$session" "$generation"; then
+      /bin/rm -f "$binding" "$binding.attempt" "$binding.payload" "$binding.keeper" "$binding.pid" "$binding.pickup"
+      remote_session_active=false
+      return 0
+    fi
+    return 1
+  }
+  interrupt_listener_bind() {
+    interrupt_status=$1
+    trap '' HUP INT TERM
+    if [ "$remote_session_active" = true ]; then
+      # A signal may arrive after the remote bind commits but before the normal
+      # publication write. Preserve the exact generation first so a failed
+      # rollback remains recoverable through an explicit `listen stop`.
+      publish_listener_binding
+      rollback_listener_start || true
+    fi
+    exit "$interrupt_status"
+  }
+  trap release_binding_lock EXIT
+  trap 'interrupt_listener_bind 129' HUP
+  trap 'interrupt_listener_bind 130' INT
+  trap 'interrupt_listener_bind 143' TERM
   cio_lock "$binding_lock"
   binding_lock_held=true
   if cio_validate_file "$binding.attempt"; then cio_die WORK_IN_PROGRESS 75; fi
@@ -208,24 +569,28 @@ listen_bind() {
   generation=$(cio_json_number binding_generation "$response")
   state=$(cio_json_string state "$response")
   case "$session:$generation:$state" in ps_*:[1-9]*:active) ;; *) /bin/rm -f "$response"; cio_die LISTEN_RESPONSE_INVALID ;; esac
+  remote_session_active=true
   # Retire any watcher for the previous local generation before publishing the
   # newly fenced binding. This prevents a live old PID from suppressing the new
   # exact-session watcher during an explicit rebind.
   cio_host_disarm "$origin" "$CIO_CONVERSATION"
-  {
-    printf 'origin=%s\n' "$origin"
-    printf 'identity=%s\n' "$CIO_IDENTITY"
-    printf 'plugin_session_id=%s\n' "$session"
-    printf 'binding_generation=%s\n' "$generation"
-    printf 'conversation_hash=%s\n' "$(cio_hash "$CIO_CONVERSATION")"
-  } | cio_atomic_write "$binding"
+  publish_listener_binding
   /bin/rm -f "$response"
   /bin/rm -f "$binding.pickup"
-  cio_host_arm "$origin" "$CIO_CONVERSATION" "$binding"
+  if ! (cio_host_arm "$origin" "$CIO_CONVERSATION" "$binding"); then
+    if rollback_listener_start; then
+      cio_die LISTENER_START_FAILED
+    fi
+    # Keep the generation-fenced binding when rollback transport fails so an
+    # explicit `listen stop` can retry instead of orphaning remote state.
+    cio_die LISTENER_START_ROLLBACK_FAILED
+  fi
+  trap '' HUP INT TERM
   cio_unlock "$binding_lock"
   binding_lock_held=false
+  remote_session_active=false
   trap - EXIT HUP INT TERM
-  printf 'ARMED @%s generation=%s verified=false\n' "$CIO_HANDLE" "$generation"
+  printf 'ARMED @%s generation=%s\n' "$CIO_HANDLE" "$generation"
 }
 
 listen_status() {
@@ -233,15 +598,83 @@ listen_status() {
   binding=$(cio_binding_file "$origin" "$conversation")
   if ! cio_validate_file "$binding"; then printf '%s\n' STOPPED; return; fi
   identity=$(cio_field "$binding" identity)
-  session=$(cio_field "$binding" plugin_session_id)
   generation=$(cio_field "$binding" binding_generation)
+  if [ "$(cio_field "$binding" delivery_contract 2>/dev/null || true)" = agent_work_wake_v1 ]; then
+    request=$(cio_temp_file); response=$(cio_temp_file)
+    work_wake_generation_body "$identity" "$generation" | cio_atomic_write "$request"
+    code=$(cio_curl "$identity" POST "$origin" /agents/me/work/wake/status "$request" "$response") || cio_die LISTEN_STATUS_FAILED
+    /bin/rm -f "$request"
+    [ "$code" = 200 ] || { /bin/rm -f "$response"; printf '%s\n' STALE; return; }
+    socket=$(cio_json_string socket "$response")
+    /bin/rm -f "$response"
+    case "$socket" in
+      connected) printf 'CONNECTED generation=%s\n' "$generation" ;;
+      disconnected) printf 'DISCONNECTED generation=%s\n' "$generation" ;;
+      *) printf '%s\n' STALE ;;
+    esac
+    return
+  fi
+  session=$(cio_field "$binding" plugin_session_id)
   request=$(cio_temp_file); response=$(cio_temp_file)
   printf '{"plugin_session_id":"%s","binding_generation":%s}\n' "$session" "$generation" | cio_atomic_write "$request"
   code=$(cio_curl "$identity" POST "$origin" /agents/me/notifications/plugin-session/status "$request" "$response") || cio_die LISTEN_STATUS_FAILED
   /bin/rm -f "$request"
-  if [ "$code" = 200 ]; then state=$(cio_json_string state "$response"); /bin/rm -f "$response"; printf '%s generation=%s verified=false\n' "$(printf '%s' "$state" | tr '[:lower:]' '[:upper:]')" "$generation"; return; fi
+  if [ "$code" = 200 ]; then
+    state=$(cio_json_string state "$response")
+    /bin/rm -f "$response"
+    remote=$(printf '%s' "$state" | tr '[:lower:]' '[:upper:]')
+    if [ "$state" = stopped ]; then
+      printf '%s generation=%s\n' "$remote" "$generation"
+      return
+    fi
+    if [ "$cio_host" = codex ]; then
+      readiness=$(cio_host_listen_readiness "$origin" 2>/dev/null || true)
+      bound_socket_device=$(cio_field "$binding" codex_socket_device 2>/dev/null || true)
+      bound_socket_inode=$(cio_field "$binding" codex_socket_inode 2>/dev/null || true)
+      bound_thread_session_id=$(cio_field "$binding" codex_thread_session_id 2>/dev/null || true)
+      expected_prefix="ready:${bound_socket_device}:${bound_socket_inode}:${bound_thread_session_id}"
+      case "$readiness" in
+        app_server_absent|app_server_untrusted|app_server_unavailable)
+          printf 'DEGRADED generation=%s remote=%s local=%s\n' "$generation" "$remote" "$readiness"
+          return
+          ;;
+        ready:*)
+          readiness_prefix=${readiness%:*}
+          if [ "$readiness_prefix" != "$expected_prefix" ]; then
+            printf 'DEGRADED generation=%s remote=%s local=app_server_changed\n' "$generation" "$remote"
+            return
+          fi
+          ;;
+        runner_absent)
+          ;;
+        *)
+          printf 'DEGRADED generation=%s remote=%s local=%s\n' "$generation" "$remote" "${readiness:-app_server_unavailable}"
+          return
+          ;;
+      esac
+      listener_state=$(cio_host_listener_state "$origin" 2>/dev/null || true)
+      if [ "$listener_state" != ready ]; then
+        printf 'DEGRADED generation=%s remote=%s local=%s\n' "$generation" "$remote" "${listener_state:-watcher_absent}"
+        return
+      fi
+      printf '%s generation=%s local=ready\n' "$remote" "$generation"
+      return
+    fi
+    printf '%s generation=%s\n' "$remote" "$generation"
+    return
+  fi
   /bin/rm -f "$response"
   printf '%s\n' STALE
+}
+
+stop_remote_plugin_session() {
+  stop_identity=$1 stop_session=$2 stop_generation=$3
+  stop_request=$(cio_temp_file); stop_response=$(cio_temp_file)
+  printf '{"plugin_session_id":"%s","binding_generation":%s}\n' "$stop_session" "$stop_generation" | cio_atomic_write "$stop_request"
+  stop_code=000
+  stop_code=$(cio_curl "$stop_identity" POST "$origin" /agents/me/notifications/plugin-session/stop "$stop_request" "$stop_response") || stop_code=000
+  /bin/rm -f "$stop_request" "$stop_response"
+  case "$stop_code" in 200|404|409) return 0 ;; *) return 1 ;; esac
 }
 
 listen_stop() {
@@ -250,11 +683,7 @@ listen_stop() {
   "$runtime_dir/listener.sh" retry-releases "$origin" >/dev/null 2>&1 || true
   binding_lock=$binding.bind-lock
   binding_lock_held=false
-  release_snapshot_ready=false
   release_binding_lock() {
-    if [ "$release_snapshot_ready" = true ]; then
-      /bin/rm -f "$binding" "$binding.payload" "$binding.keeper" "$binding.pid" "$binding.pickup"
-    fi
     if [ "$binding_lock_held" = true ]; then
       binding_lock_held=false
       cio_unlock "$binding_lock" >/dev/null 2>&1 || true
@@ -267,7 +696,7 @@ listen_stop() {
   cio_lock "$binding_lock"
   binding_lock_held=true
   if ! cio_validate_file "$binding"; then
-    /bin/rm -f "$binding.attempt" "$binding.payload" "$binding.keeper" "$binding.pid" "$binding.pickup"
+    /bin/rm -f "$binding.attempt" "$binding.payload" "$binding.keeper" "$binding.pid" "$binding.pickup" "$binding.identity"
     cio_unlock "$binding_lock"; binding_lock_held=false; trap - EXIT HUP INT TERM
     printf '%s\n' STOPPED
     return
@@ -275,6 +704,29 @@ listen_stop() {
   identity=$(cio_field "$binding" identity)
   session=$(cio_field "$binding" plugin_session_id)
   generation=$(cio_field "$binding" binding_generation)
+  if [ "$(cio_field "$binding" delivery_contract 2>/dev/null || true)" = agent_work_wake_v1 ]; then
+    cio_host_disarm "$origin" "$conversation"
+    if cio_validate_file "$binding.attempt" && [ "$(cio_field "$binding.attempt" kind 2>/dev/null || true)" = work ]; then
+      if ! "$runtime_dir/listener.sh" release "$origin" >/dev/null 2>&1; then
+        # Settlement and release share the attempt lock. If settlement won
+        # after this preflight, the attempt is already gone and Stop has
+        # nothing left to release. Preserve failures that leave state behind.
+        [ ! -e "$binding.attempt" ] || cio_die LISTEN_STOP_FAILED
+      fi
+    fi
+    /bin/rm -f "$binding.attempt" "$binding.payload" "$binding.keeper" "$binding.pid" "$binding.pickup"
+    request=$(cio_temp_file); response=$(cio_temp_file)
+    work_wake_generation_body "$identity" "$generation" | cio_atomic_write "$request"
+    code=$(cio_curl "$identity" POST "$origin" /agents/me/work/wake/stop "$request" "$response") || code=000
+    /bin/rm -f "$request" "$response"
+    case "$code" in 200|401|404|409) ;; *) cio_die LISTEN_STOP_FAILED ;; esac
+    /bin/rm -f -- "$binding" "$binding.identity"
+    cio_unlock "$binding_lock"
+    binding_lock_held=false
+    trap - EXIT HUP INT TERM
+    printf '%s\n' STOPPED
+    return
+  fi
   had_attempt=false
   if cio_validate_file "$binding.attempt"; then
     had_attempt=true
@@ -284,19 +736,14 @@ listen_stop() {
   release_snapshot=$cio_state/.release.$cio_host.$(cio_origin_key "$origin").$(openssl rand -hex 8)
   if [ "$had_attempt" = true ]; then
     /bin/mv "$binding.attempt" "$release_snapshot"
-    release_snapshot_ready=true
   fi
-  /bin/rm -f "$binding" "$binding.payload" "$binding.keeper" "$binding.pid" "$binding.pickup"
+  /bin/rm -f "$binding.payload" "$binding.keeper" "$binding.pid" "$binding.pickup"
   if [ "$had_attempt" = true ]; then
     "$runtime_dir/listener.sh" release-snapshot "$origin" "" "$release_snapshot" >/dev/null 2>&1 || true
   fi
-  release_snapshot_ready=false
-  request=$(cio_temp_file); response=$(cio_temp_file)
-  printf '{"plugin_session_id":"%s","binding_generation":%s}\n' "$session" "$generation" | cio_atomic_write "$request"
-  code=$(cio_curl "$identity" POST "$origin" /agents/me/notifications/plugin-session/stop "$request" "$response") || true
-  /bin/rm -f "$request" "$response"
   /bin/rm -f "$binding.attempt" "$binding.payload" "$binding.keeper" "$binding.pid" "$binding.pickup"
-  [ "${code:-000}" = 200 ] || [ "${code:-000}" = 404 ] || [ "${code:-000}" = 409 ] || cio_die LISTEN_STOP_FAILED
+  stop_remote_plugin_session "$identity" "$session" "$generation" || cio_die LISTEN_STOP_FAILED
+  /bin/rm -f "$binding"
   cio_unlock "$binding_lock"
   binding_lock_held=false
   trap - EXIT HUP INT TERM
@@ -305,9 +752,15 @@ listen_stop() {
 
 choose_handle() {
   ensure_identity
-  installation=$(cio_field "$CIO_IDENTITY" installation_id)
+  installation=$(cio_field "$CIO_IDENTITY" installation_id 2>/dev/null || true)
+  if [ -z "$installation" ]; then
+    install=$(cio_install_file "$origin")
+    installation=$(cio_field "$install" installation_id 2>/dev/null || true)
+  fi
+  [ -n "$installation" ] || cio_die SETUP_REQUIRED 2
   url=$origin/setup/plugin/handle#installation=$installation\&conversation=$CIO_CONVERSATION
   cio_open_browser "$url" || true
+  printf 'pending=1\n' | cio_atomic_write "$CIO_IDENTITY.remap"
   printf 'CHOOSE %s\n' "$url"
 }
 
@@ -362,12 +815,39 @@ case "$command:$subcommand" in
   identity:) ensure_identity; printf 'IDENTITY @%s kind=%s\n' "$CIO_HANDLE" "$CIO_KIND" ;;
   request:) request_api ;;
   adopt:) adopt_document ;;
+  listen:adopt) listen_adopt ;;
   listen:bind) listen_bind ;;
   listen:status) listen_status ;;
-  listen:stop) listen_stop ;;
+  listen:stop)
+    if [ "$origin_explicit" = false ]; then
+      stop_origins=$(cio_discover_conversation_origins 2>/dev/null || true)
+      if [ -n "$stop_origins" ]; then
+        conversation=$(cio_conversation_id)
+        while IFS= read -r stop_origin; do
+          [ -n "$stop_origin" ] || continue
+          cio_host_disarm "$stop_origin" "$conversation" >/dev/null 2>&1 || true
+        done <<EOF
+$stop_origins
+EOF
+        stop_status=0
+        while IFS= read -r stop_origin; do
+          [ -n "$stop_origin" ] || continue
+          rc=0
+          (origin=$stop_origin; listen_stop) || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            stop_status=$rc
+          fi
+        done <<EOF
+$stop_origins
+EOF
+        exit "$stop_status"
+      fi
+    fi
+    listen_stop
+    ;;
   listen:choose-handle) choose_handle ;;
   receive:) cio_host_receive "$origin" ;;
-  settle:) cio_host_settle "$origin" "$outcome" "$operation" "$reply_operation" "$edit_operation" ;;
+  settle:) cio_host_settle "$origin" "$outcome" "$operation" "$reply_operation" "$edit_operation" "$work_item_ids" ;;
   release:) cio_host_release "$origin" ;;
   hook:) cio_host_hook "$origin" ;;
   *) cio_die USAGE 64 ;;

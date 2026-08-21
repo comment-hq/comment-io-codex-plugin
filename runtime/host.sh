@@ -14,6 +14,8 @@ cio_open_browser() {
 }
 cio_host_arm() { "$runtime_dir/listener.sh" codex-arm "$@"; }
 cio_host_disarm() { "$runtime_dir/listener.sh" codex-disarm "$@"; }
+cio_host_listen_readiness() { "$runtime_dir/listener.sh" codex-preflight "$@"; }
+cio_host_listener_state() { "$runtime_dir/listener.sh" codex-listener-state "$@"; }
 cio_host_receive() { "$runtime_dir/listener.sh" receive "$1"; }
 cio_host_settle() { "$runtime_dir/listener.sh" settle "$@"; }
 cio_host_release() { "$runtime_dir/listener.sh" release "$1"; }

@@ -7,48 +7,52 @@ description: Create a new Comment.io Comm from supplied context, a matching temp
 
 Create and fill one readable Comm, then leave the user at its canonical link.
 
-## 1. Establish the route and identity
+## 1. Get the purpose
 
-Invoke the installed `comment` skill before any Comment.io action. Let it select
-the exact origin, fetch live API guidance, and establish the conversation
-identity. Then invoke `listen`; this request authorizes arming the same identity.
-An unavailable listener does not block creation.
+Use the supplied source, notes, or prior context to identify what the Comm
+should help its readers understand, decide, or produce. With neither a source
+nor enough context to determine that purpose, immediately ask:
+
+> What should this Comm help its readers understand, decide, or produce?
+
+Wait for the answer before invoking `comment` or `listen`. When a source is
+already supplied, continue without asking; read it after establishing any
+access route it requires and infer its purpose from the content.
+
+This step is complete when the purpose is supplied or a source is available
+from which to infer it.
+
+## 2. Establish the route and identity
+
+Invoke the installed `comment` skill before any Comment.io action. Then invoke
+`listen`; this request authorizes arming the same identity. An unavailable
+listener does not block creation.
 
 This step is complete when creation, editing, and listening use one origin and
 one identity policy.
 
-## 2. Resolve the source
+## 3. Resolve the source
 
 - Read a supplied file, URL, prior Comm, or other source with an available
   native capability.
 - Otherwise use supplied notes or prior context.
-- With neither a source nor enough context to determine the Comm's purpose, ask
-  what the user wants the Comm to be about.
+- Confirm the purpose identified or inferred in step 1 against the resolved
+  source.
 
-Do not create a placeholder while required source material or purpose is
-missing. This step is complete when the content and purpose are usable.
+This step is complete when the content and purpose are usable.
 
-## 3. Choose the structure
+## 4. Create one Comm
 
-Search available Comment.io templates with a broad, distinctive term for the
-source's purpose. Compare plausible results by title, description, keywords,
-and instructions.
-
-When a supplied source has a strong template match, ask whether to rewrite it
-to fit the template or import its visible content and structure unchanged.
-For an unchanged import, preserve visible content and hierarchy and add native
-instructions that guide future work in every section and nested subsection.
-
-Otherwise use an obvious matching template without another confirmation. With
-no strong match, create a blank Comm with native whole-document instructions,
-the required headings, and native section instructions for every structural
-section at every depth. Instructions are metadata, not body copy.
+Call `create_comm` now with `markdown` set to the requested content and
+`agent_token` from this conversation's mint. When the user asked for a
+template, use `list_templates` then `get_template` then `create_from_template`
+with the same `agent_token`. Keep the human-openable URL from that one creation.
 
 Immediately retain the exact human-openable URL returned by creation. Creation
 is final at that point; recover later failures against that Comm instead of
 creating another one.
 
-## 4. Fill and hand off
+## 5. Fill and hand off
 
 Write from the resolved source and follow all document and section
 instructions. Preserve meaning and requested detail. Mark unknowns instead of
