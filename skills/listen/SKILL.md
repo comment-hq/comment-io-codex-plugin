@@ -18,15 +18,15 @@ Call `create_ephemeral_agent` immediately (the host may prefix the name).
 Never inspect ALL_TOOLS or print tool descriptions. Never call `list_agents`.
 If that call is available, those tools are logged in. If this skill loaded
 and that call is unavailable, this plugin is installed and
-the tools are not logged in: ask the user to connect `comment-io-staging`
-(or the Comment.io tools already listed in this host), complete browser
-login, and retry listen in a new chat. If the user asked to listen and this
+the tools are not logged in: ask the user to connect the production Comment.io
+tools already listed in this host, complete browser login, and retry listen in
+a new chat. If the user asked to listen and this
 skill is not available, the plugin is not installed. Do not search the repo.
 Do not inspect plugin state.
 Do not run `identity` or `listen bind` as a substitute.
 
-1. Resolve the exact HTTPS origin as the `comment` skill does. Staging uses
-   `https://comt.dev` when that is the connected origin.
+1. Resolve the exact production HTTPS origin as the `comment` skill does. With
+   no target context, use `https://comment.io`.
 2. Call `create_ephemeral_agent` now with no arguments. Omit `idempotency_key`
    and mint once. Keep the returned `data` object in this conversation. A saved
    Durable Agent Token skips this mint. Do not reread skills from disk.

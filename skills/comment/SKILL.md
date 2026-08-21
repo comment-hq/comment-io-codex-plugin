@@ -10,10 +10,10 @@ without credentials or redirects, accept only its exact Comment.io HTTPS
 origin and `/d/{slug}` target, then use that origin for the entire task. With no
 target context use `https://comment.io`.
 
-Use the Comment.io tools already in this session. If `create_ephemeral_agent`
-is missing, those tools are not logged in: ask the user to connect them in this
-host, complete browser login, and continue in a new chat. Do not inspect plugin
-state. When those tools are `comment-io-staging`, the origin is `https://comt.dev`.
+Use the production Comment.io tools already in this session. If
+`create_ephemeral_agent` is missing, those tools are not logged in: ask the user
+to connect the production Comment.io tools in this host, complete browser login,
+and continue in a new chat. Do not inspect plugin state.
 
 - `create_ephemeral_agent` — mint the conversation identity and one Agent Token
 - `create_comm` — new Comm; `markdown` and `agent_token` from the mint
